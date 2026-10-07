@@ -1,0 +1,457 @@
+// Additional scratch, allocated once. F: scratch, frozen c_i, shared face flux;
+// face work: forward MacCormack and two nearest-source extension banks.
+layout(std430,set=0,binding=9) buffer MotionWork { float motion[]; };
+layout(std430,set=0,binding=10) buffer StepHistory { vec4 history[]; };
+// fixture: initialization shape, gravity multiplier, CFL mode, history capacity.
+// c20 dt,21 sweep,22/23 staged roundoff,24/25 accepted roundoff,
+// 26 initial volume,27 max Courant,28 last mass defect,29 retry count.
+uint faces(){return NU()+NV()+NW();}
+uint flux_base(){return 2*N();}
+uint forward_base(){return flux_base()+faces();}
+uint source_base(int bank){return forward_base()+faces()+uint(bank)*faces();}
+uint valid_base(int bank){return source_base(0)+2*faces()+uint(bank)*faces();}
+uint pressure_mask_base(int bank){return valid_base(0)+2*faces()+uint(bank)*N();}
+uint face_local(ivec3 q,int axis){return face_index(q,axis)-U();}
+void unpack_face(uint f,out ivec3 q,out int axis){
+ axis=f<NU()?0:(f<NU()+NV()?1:2);uint base=axis==0?0:(axis==1?NU():NU()+NV());ivec3 n=dims();n[axis]++;q=coord(f-base,n);
+}
+vec3 periodic_delta(ivec3 a,ivec3 b){
+ vec3 d=vec3(a-b),n=vec3(dims());d.z-=round(d.z/n.z)*n.z;
+ if(pc.options.x>.5)d.x-=round(d.x/n.x)*n.x;
+ return d*pc.spacing_dt.xyz;
+}
+bool wall_face(ivec3 q,int axis){ivec3 l=q;l[axis]--;return solid(q)||solid(l);}
+bool face_in_bounds(ivec3 q,int axis){ivec3 n=dims();n[axis]++;return all(greaterThanEqual(q,ivec3(0)))&&all(lessThan(q,n));}
+ivec3 wrap_face(ivec3 q,int axis){
+ ivec3 n=dims();q.z=periodic_index(q.z,n.z);if(pc.options.x>.5)q.x=periodic_index(q.x,n.x);return q;
+}
+float old_face(ivec3 q,int axis){
+ q=wrap_face(q,axis);
+#ifdef COASTAL
+ if(q.x<0&&!wall_face(q,axis))return coastal_velocity(coastal_face_position(q,axis),c[1])[axis];
+#endif
+ if(!face_in_bounds(q,axis)||wall_face(q,axis))return 0;
+ return get_value(accepted(),face_index(q,axis));
+}
+float transport_f(ivec3 q){
+ q=wrap_cell(q);
+#ifdef COASTAL
+ if(q.x<0&&!solid(q))return coastal_fraction(q,c[1]);
+#endif
+ if(outside(q)||solid(q))return 0;
+ uint i=index3(q,dims());int sweep=int(c[21]);
+ return sweep==0?get_value(accepted(),i):(sweep==1?get_value(candidate(),i):motion[i]);
+}
+// Share the identical arithmetic with geometric flux and compression. In a
+// fully flooded stencil their contributions cancel exactly before adding F.
+float face_courant(ivec3 q,int axis){
+ precise float value=old_face(q,axis)*timestep()/pc.spacing_dt[axis];return value;
+}
+vec4 transport_plane(ivec3 q){
+ float f=transport_f(q);if(f<=0||f>=1)return vec4(0,1,0,f);
+ vec3 g=interface_gradient(q,1);
+ if(height_normals_enabled()){bool used;g=height_normal(q,g,pc.spacing_dt.xyz,1,used);}
+ if(length(g)<1e-9)g=vec3(0,1,0);vec3 normal=normalize(g)*pc.spacing_dt.xyz;normal/=dot(abs(normal),vec3(1));
+ return vec4(normal,inverse_volume(normal,f));
+}
+void bounds_reduce(vec4 v){
+ uint lid=gl_LocalInvocationID.x;reduction[lid]=v;barrier();
+ for(uint d=64;d>0;d>>=1){if(lid<d){reduction[lid].x=min(reduction[lid].x,reduction[lid+d].x);reduction[lid].y=max(reduction[lid].y,reduction[lid+d].y);reduction[lid].zw+=reduction[lid+d].zw;}barrier();}
+ if(lid==0)partial[gl_WorkGroupID.x]=reduction[0];
+}
+// Source coordinates exclude the origin; component lattices are staggered.
+// Ghost velocities reflect evenly tangentially and oddly normally. Voxel donors
+// use the nearest wall within three layers, with axis order breaking ties.
+// Trajectories through solids remain invalid.
+bool reflect_voxel_donor(inout ivec3 q,int component,out float parity){
+ float best=1e20;ivec3 selected=q;parity=1;
+ for(int axis=0;axis<3;axis++)for(int sign=-1;sign<=1;sign+=2){
+  for(int layer=1;layer<=3;layer++){
+   ivec3 edge=q;edge[axis]+=sign*layer;edge=wrap_face(edge,component);
+   if(!face_in_bounds(edge,component))break;
+   ivec3 left=edge;left[component]--;
+   bool sl=solid(left),sr=solid(edge);
+   bool boundary=axis==component?(sl!=sr):(!sl&&!sr);
+   if(!boundary)continue;
+   ivec3 mirror=q;mirror[axis]+=sign*(2*layer-(axis==component?0:1));mirror=wrap_face(mirror,component);
+   float distance=(float(layer)-(axis==component?0:.5))*pc.spacing_dt[axis];
+   if(face_in_bounds(mirror,component)&&!wall_face(mirror,component)&&distance<best){
+    selected=mirror;best=distance;parity=axis==component?-1:1;
+   }
+   break;
+  }
+ }
+ q=selected;return best<1e19;
+}
+float velocity_donor(ivec3 q,int axis,bool forward,out bool valid){
+ float parity=1;
+ if(q.y<0){q.y=-q.y-(axis==1?0:1);if(axis==1)parity=-parity;}
+ if(pc.options.x<.5){
+#ifndef COASTAL
+  if(q.x<0){q.x=-q.x-(axis==0?0:1);if(axis==0)parity=-parity;}
+#endif
+  if(q.x>=dims().x+(axis==0?1:0)){q.x=2*dims().x-q.x-(axis==0?0:1);if(axis==0)parity=-parity;}
+ }
+ q=wrap_face(q,axis);
+#ifdef COASTAL
+ if(q.x<0&&q.y>=0&&q.y<dims().y&&!wall_face(q,axis)){valid=true;return parity*coastal_velocity(coastal_face_position(q,axis),c[1])[axis];}
+#endif
+ if(!face_in_bounds(q,axis)){valid=false;return 0;}
+ ivec3 l=q;l[axis]--;bool left=solid(l),right=solid(q);
+ // Prescribed normal wall faces remain exactly zero. Buried interpolation
+ // donors are reflected; physical trajectories are still rejected separately.
+ if(left!=right){valid=true;return 0;}
+ if(left&&right){
+  float reflection;
+  if(!reflect_voxel_donor(q,axis,reflection)){valid=false;return 0;}
+  parity*=reflection;
+ }
+ uint f=face_local(q,axis);valid=motion[valid_base(accepted())+f]>.5;
+ return parity*(forward?motion[forward_base()+f]:get_value(accepted(),face_index(q,axis)));
+}
+float sampled_component(vec3 x,int axis,bool forward,out bool valid,out vec2 limits){
+ vec3 lattice=x/pc.spacing_dt.xyz-.5;lattice[axis]+=.5;
+ ivec3 lo=ivec3(floor(lattice));vec3 t=fract(lattice);limits=vec2(1e20,-1e20);valid=true;
+ // All donors strictly interior and above the highest voxel in this stencil:
+ // no wall reflection, periodic alias or coastal ghost can occur. The bottom
+ // test is conservative for the current monotone heightfield; fallback handles
+ // every boundary. Valid-band checks and the interpolation arithmetic remain.
+ bool interior=(int(pc.numerics.w)&8)!=0&&all(greaterThanEqual(lo,ivec3(1)))&&all(lessThan(lo+1,dims()))&&!solid(ivec3(lo.x+1,lo.y-1,lo.z));
+ ivec3 fn=dims();fn[axis]++;uint base=face_local(lo,axis);
+ float values[8];
+ for(int z=0;z<2;z++)for(int y=0;y<2;y++)for(int xx=0;xx<2;xx++){
+  ivec3 d=ivec3(xx,y,z);bool supported;
+  float value;
+  if(interior){uint f=base+uint(xx+fn.x*(y+fn.y*z));supported=motion[valid_base(accepted())+f]>.5;value=forward?motion[forward_base()+f]:get_value(accepted(),U()+f);}
+  else value=velocity_donor(lo+d,axis,forward,supported);
+  values[xx+2*y+4*z]=value;
+  vec3 w=mix(vec3(1)-t,t,vec3(d));
+  if(w.x*w.y*w.z>0){valid=valid&&supported;limits.x=min(limits.x,value);limits.y=max(limits.y,value);}
+ }
+ // Difference form exactly preserves a constant field, including an invariant
+ // alongshore direction. Summing eight weighted products introduced ULP noise.
+ float a=fma(t.x,values[1]-values[0],values[0]),b=fma(t.x,values[3]-values[2],values[2]);
+ float d=fma(t.x,values[5]-values[4],values[4]),e=fma(t.x,values[7]-values[6],values[6]);
+ float lower=fma(t.y,b-a,a),upper=fma(t.y,e-d,d);
+ return fma(t.z,upper-lower,lower);
+}
+vec3 sampled_velocity(vec3 x){vec3 v;for(int axis=0;axis<3;axis++){bool valid;vec2 limits;v[axis]=sampled_component(x,axis,false,valid,limits);}return v;}
+vec3 trace(vec3 x,float dt){precise vec3 mid=x-.5*dt*sampled_velocity(x);precise vec3 end=x-dt*sampled_velocity(mid);return end;}
+bool trace_supported(vec3 x,float dt){
+ precise vec3 mid=x-.5*dt*sampled_velocity(x),end=x-dt*sampled_velocity(mid);
+ for(int stage=0;stage<3;stage++){
+  vec3 point=stage==0?x:(stage==1?mid:end);
+  if(solid(ivec3(floor(point/pc.spacing_dt.xyz))))return false;
+  for(int axis=0;axis<3;axis++){bool valid;vec2 limits;sampled_component(point,axis,false,valid,limits);if(!valid)return false;}
+ }
+ return true;
+}
+// Reuse accepted-field trajectories and checks; the two MacCormack passes
+// remain separated by a barrier. The six fields are scratch only.
+uint trace_cache_base(){return 4*N()+6*faces();}
+vec3 sampled_velocity_checked(vec3 x,out bool supported){
+ vec3 value;supported=true;
+ for(int axis=0;axis<3;axis++){bool valid;vec2 limits;value[axis]=sampled_component(x,axis,false,valid,limits);supported=supported&&valid;}
+ return value;
+}
+float checked_endpoint(vec3 x,int component,bool forward,out bool supported,out vec2 limits){
+ float value=0;supported=true;limits=vec2(0);
+ for(int axis=0;axis<3;axis++){
+  bool valid;vec2 donor_limits;float donor_value=sampled_component(x,axis,axis==component&&forward,valid,donor_limits);
+  supported=supported&&valid;if(axis==component){value=donor_value;limits=donor_limits;}
+ }
+ return value;
+}
+bool trace_points_clear(vec3 x,vec3 mid,vec3 end){
+ return !solid(ivec3(floor(x/pc.spacing_dt.xyz)))&&!solid(ivec3(floor(mid/pc.spacing_dt.xyz)))&&!solid(ivec3(floor(end/pc.spacing_dt.xyz)));
+}
+float cached_advection(uint i,vec3 x,int axis,float dt,bool correct){
+ uint base=trace_cache_base(),nf=faces();
+ if(!correct){
+  bool valid_start,valid_mid,valid_end;vec2 limits;
+  vec3 start_velocity=sampled_velocity_checked(x,valid_start);
+  precise vec3 mid=x-.5*dt*start_velocity,end=x-dt*sampled_velocity_checked(mid,valid_mid);
+  float value=checked_endpoint(end,axis,false,valid_end,limits);
+  motion[base+i]=limits.x;motion[base+nf+i]=limits.y;
+  motion[base+2*nf+i]=valid_start&&valid_mid&&valid_end&&trace_points_clear(x,mid,end)?1:0;
+  for(int k=0;k<3;k++)motion[base+uint(3+k)*nf+i]=start_velocity[k];
+  return value;
+ }
+ float forward=motion[forward_base()+i];if(motion[base+2*nf+i]<.5)return forward;
+ vec3 start_velocity;for(int k=0;k<3;k++)start_velocity[k]=motion[base+uint(3+k)*nf+i];
+ bool valid_mid,valid_end;vec2 unused;
+ // The reverse trace uses the same signed-dt arithmetic.
+ float reverse_dt=-dt;precise vec3 mid=x-.5*reverse_dt*start_velocity,end=x-reverse_dt*sampled_velocity_checked(mid,valid_mid);
+ float backward=checked_endpoint(end,axis,true,valid_end,unused);
+ float value=forward+.5*(get_value(accepted(),U()+i)-backward);
+ return valid_mid&&valid_end&&trace_points_clear(x,mid,end)&&value>=motion[base+i]&&value<=motion[base+nf+i]?value:forward;
+}
+float courant_at(ivec3 q,int bank,bool accelerate){
+ vec3 speed=vec3(0);
+ for(int axis=0;axis<3;axis++){ivec3 r=q;r[axis]++;speed[axis]=max(abs(get_value(bank,face_index(q,axis))),abs(get_value(bank,face_index(r,axis))));}
+#ifdef COASTAL
+ if(accelerate&&coastal_rate(center(q).x)>0&&center(q).y<coastal_surface(center(q).x,c[1]+pc.spacing_dt.w).x+3*pc.spacing_dt.y){
+  for(int axis=0;axis<3;axis++){
+   ivec3 r=q;r[axis]++;
+   speed[axis]=max(speed[axis],max(abs(coastal_velocity(coastal_face_position(q,axis),c[1]+pc.spacing_dt.w)[axis]),abs(coastal_velocity(coastal_face_position(r,axis),c[1]+pc.spacing_dt.w)[axis])));
+  }
+ }
+#endif
+ if(accelerate)speed.y+=9.81*pc.spacing_dt.w*pc.fixture.y;
+ speed/=pc.spacing_dt.xyz;return pc.fixture.z>.5?max(speed.x,max(speed.y,speed.z)):dot(speed,vec3(1));
+}
+float linear_streamfunction(vec3 x){
+ float value=pc.wave.x*pc.wave.z/(pc.wave.y*sinh(pc.wave.y*pc.wave.w))*sinh(pc.wave.y*(x.y+pc.wave.w))*cos(pc.wave.y*x.x);
+ if(pc.numerics.z>.5)value+=.375*pc.wave.x*pc.wave.x*pc.wave.z/pow(sinh(pc.wave.y*pc.wave.w),4)*sinh(2*pc.wave.y*(x.y+pc.wave.w))*cos(2*pc.wave.y*x.x);
+ return value;
+}
+bool projected_face(ivec3 q,int axis){
+ q=wrap_face(q,axis);if(!face_in_bounds(q,axis)||wall_face(q,axis))return false;
+ ivec3 l=q;l[axis]--;return wet(q)||wet(l);
+}
+float extended_value(uint source,ivec3 target){
+ float value=get_value(candidate(),U()+source);
+ if(pc.numerics.y<.5)return value;
+ ivec3 q;int component;unpack_face(source,q,component);
+ vec3 gradient=vec3(0);
+ for(int axis=0;axis<3;axis++){
+  ivec3 l=q,r=q;l[axis]--;r[axis]++;l=wrap_face(l,component);r=wrap_face(r,component);
+  bool left=projected_face(l,component),right=projected_face(r,component);
+  float dl=left?value-get_value(candidate(),face_index(l,component)):0;
+  float dr=right?get_value(candidate(),face_index(r,component))-value:0;
+  if(left&&right)gradient[axis]=dl*dr>0?sign(dl)*min(abs(dl),abs(dr)):0;
+  else gradient[axis]=left?dl:(right?dr:0);
+ }
+ // A one-cell linear continuation, constant farther into the three-layer band.
+ // Donors remain fixed projected faces from the chosen nearest source. Never
+ // average sources across an air gap, change wet faces, or modify fractions.
+ vec3 offset=clamp(periodic_delta(target,q)/pc.spacing_dt.xyz,vec3(-1),vec3(1));
+ return value+dot(gradient,offset);
+}
+void motion_pass(){
+ uint i=gl_GlobalInvocationID.x;int op=int(pc.dims_op.w);ivec3 n=dims();float dt=timestep();
+ bool setup=c[5]>.5&&c[7]<.5;
+ if(op==40){ // initialization after base-bank clear, before first projection
+  if(i<N()){
+   ivec3 q=coord(i,n);vec3 lo=vec3(q)*pc.spacing_dt.xyz,hi=lo+pc.spacing_dt.xyz;
+   float f=get_value(accepted(),i);
+   if(pc.fixture.x>.5&&pc.fixture.x<2.5){
+    vec3 lower=pc.fixture.x<1.5?vec3(0):vec3(.22,.28,.06);
+    vec3 upper=pc.fixture.x<1.5?vec3(.28,.3,100):vec3(.42,.48,.22);
+    vec3 overlap=clamp((min(hi,upper)-max(lo,lower))/pc.spacing_dt.xyz,vec3(0),vec3(1));f=overlap.x*overlap.y*overlap.z;
+    // Falling block above a shallow receiving pool.
+    if(pc.fixture.x>1.5)f+=clamp((.08-lo.y)/pc.spacing_dt.y,0,1);
+   }
+   if(pc.fixture.x==4){
+    f=0;
+    for(int block=0;block<2;block++){
+     vec3 lower=vec3(block==0?.08:.36,.12,0),upper=vec3(block==0?.24:.52,.32,100);
+     vec3 overlap=clamp((min(hi,upper)-max(lo,lower))/pc.spacing_dt.xyz,vec3(0),vec3(1));f+=overlap.x*overlap.y*overlap.z;
+    }
+   }
+   a[i]=f;b[i]=f;
+  }
+  if(i<faces()){
+   ivec3 q;int axis;unpack_face(i,q,axis);
+   float velocity=pc.fixture.x==3&&axis==0&&!wall_face(q,axis)&&center(q).y<pc.origin_eta.w+3*pc.spacing_dt.y?.25:0;
+   if(pc.fixture.x==4&&axis==0&&!wall_face(q,axis))velocity=float(q.x)*pc.spacing_dt.x<.3?2:-2;
+   if(pc.fixture.x==5){
+    vec3 x=(vec3(q)+.5)*pc.spacing_dt.xyz+pc.origin_eta.xyz;x[axis]-=.5*pc.spacing_dt[axis];
+    // Discrete curl of a shared vertex streamfunction: divergence-free initial
+    // MAC advector, rather than an unprojected sampled continuum velocity.
+    if(x.y<eta(q)+3*pc.spacing_dt.y&&!wall_face(q,axis)){
+     if(axis==0)velocity=(linear_streamfunction(x+vec3(0,.5*pc.spacing_dt.y,0))-linear_streamfunction(x-vec3(0,.5*pc.spacing_dt.y,0)))/pc.spacing_dt.y;
+     if(axis==1)velocity=-(linear_streamfunction(x+vec3(.5*pc.spacing_dt.x,0,0))-linear_streamfunction(x-vec3(.5*pc.spacing_dt.x,0,0)))/pc.spacing_dt.x;
+    }
+   }
+   a[U()+i]=velocity;b[U()+i]=velocity;
+  }
+  if(i==0){c[20]=pc.spacing_dt.w;c[31]=pc.fixture.y;}return;
+ }
+ if(op==62){
+  if(c[4]<.5||c[6]<.5||c[7]>.5)return;float r=0;
+  if(i<N()){ivec3 q=coord(i,n);if(wet(q))r=1000/dt*divergence(q);}
+  sum_partial(vec4(r*r,0,0,0));return;
+ }
+ if(op==66){
+  if(c[4]<.5||c[6]<.5||c[7]>.5)return;
+  float residual2=global_reduce(false).x;if(i!=0)return;c[60]=sqrt(residual2/max(c[59],1e-30));
+  c[62]=pressure_scaled_norm(c[59]);c[63]=pressure_scaled_norm(residual2);
+  c[61]=pressure_norm_converged(residual2,c[59])?1:0;return;
+ }
+ if(op==63){if(i==0&&c[57]==1&&c[7]<.5){c[57]=2;c[6]=0;c[8]=0;}return;}
+ if(op==64){if(i<N()&&c[57]==2&&c[7]<.5){work[13*N()+i]=get_value(candidate(),P()+i);put_value(candidate(),P()+i,0);}return;}
+ if(op==65){if(i<N()&&c[4]>.5&&c[6]>.5&&c[7]<.5)put_value(candidate(),P()+i,get_value(candidate(),P()+i)+work[13*N()+i]);return;}
+ if(op==60){
+  uint columns=uint(n.x*n.z);vec4 v=vec4(0);
+  if(i<columns){
+   int x=int(i)%n.x,z=int(i)/n.x;float height=pc.origin_eta.y;
+   for(int y=0;y<n.y;y++)height+=get_value(accepted(),index3(ivec3(x,y,z),n))*pc.spacing_dt.y;
+   float phase=pc.wave.y*(pc.origin_eta.x+(float(x)+.5)*pc.spacing_dt.x);
+   v=vec4(height*cos(phase),height*sin(phase),height,0);
+  }sum_partial(v);return;
+ }
+ if(op==61){
+  if(i!=0)return;uint columns=uint(n.x*n.z);vec4 sum=vec4(0);
+  for(uint k=0;k<(columns+127)/128;k++)sum+=partial[k];
+  c[42]=2*sum.x/float(columns);c[43]=2*sum.y/float(columns);c[44]=sum.z/float(columns);
+  for(int gauge=0;gauge<8;gauge++){
+   int x=(gauge*n.x)/8;float height=pc.origin_eta.y;
+   for(int y=0;y<n.y;y++)height+=get_value(accepted(),index3(ivec3(x,y,n.z/2),n))*pc.spacing_dt.y;
+   c[48+gauge]=height;
+  }return;
+ }
+ if(op==55){
+  if(!setup)return;vec3 boundary=vec3(0);
+  if(i<N()){
+   ivec3 q=coord(i,n);int axis=(int(c[2])+int(c[21]))%3;
+   if(axis==1&&q.y==n.y-1){q.y++;boundary.x=motion[flux_base()+face_local(q,1)]*pc.spacing_dt.x*pc.spacing_dt.y*pc.spacing_dt.z;}
+#ifdef COASTAL
+   if(axis==0&&q.x==0){float flux=motion[flux_base()+face_local(q,0)]*pc.spacing_dt.x*pc.spacing_dt.y*pc.spacing_dt.z;boundary.y=max(flux,0);boundary.z=max(-flux,0);}
+#endif
+  }sum_partial(vec4(boundary,0));return;
+ }
+ if(op==56){if(!setup)return;vec4 v=global_reduce(false);if(i==0){c[39]+=v.x;
+#ifdef COASTAL
+  c[65]+=v.y;c[66]+=v.z;
+#endif
+ }return;}
+ if(op==47){
+  if(c[4]<.5||c[7]>.5||i>=faces())return;ivec3 q;int axis;unpack_face(i,q,axis);
+  uint canonical=face_index(q,axis);if(canonical!=U()+i)put_value(candidate(),U()+i,get_value(candidate(),canonical));return;
+ }
+ if(op==48||op==49){
+  bool initial=op==49;if(!initial&&(c[4]<.5||c[6]<.5||c[7]>.5))return;
+  if(i<N()){
+   float flag=wet(coord(i,n))?1:0;
+   if(initial){motion[pressure_mask_base(0)+i]=flag;motion[pressure_mask_base(1)+i]=flag;}
+   else motion[pressure_mask_base(candidate())+i]=flag;
+  }
+  if(i<faces()){
+   ivec3 q;int axis;unpack_face(i,q,axis);
+   ivec3 l=q;l[axis]--;
+   float valid=initial?(!wall_face(q,axis)&&(wet(q)||wet(l)||center(q).y<eta(q)+3*pc.spacing_dt.y)?1:0):(motion[source_base(1)+i]>=0?1:0);
+   if(initial){motion[valid_base(0)+i]=valid;motion[valid_base(1)+i]=valid;}
+   else motion[valid_base(candidate())+i]=valid;
+  }return;
+ }
+ if(op==44){
+  if(i==0&&c[32]>0&&c[32]<=pc.fixture.w){uint row=(uint(c[32])-1)*4+3;history[row]=vec4(c[1],c[20],c[7]>0?-c[7]:(c[4]<.5?1:0),c[2]);}return;
+ }
+ if(op==45){
+  if(!setup)return;vec4 v=vec4(0);
+  if(i<N()){
+   ivec3 q=coord(i,n);float f=get_value(accepted(),i);float divergence=0,raw_divergence=0;
+   for(int axis=0;axis<3;axis++){ivec3 r=q;r[axis]++;divergence+=(old_face(r,axis)-old_face(q,axis))/pc.spacing_dt[axis];raw_divergence+=(get_value(accepted(),face_index(r,axis))-get_value(accepted(),face_index(q,axis)))/pc.spacing_dt[axis];}
+   float cell=pc.spacing_dt.x*pc.spacing_dt.y*pc.spacing_dt.z;
+   v=vec4(f>.5?dt*divergence*cell:0,f>.5&&motion[pressure_mask_base(accepted())+i]<.5?1:0,f*cell,f>.5?dt*raw_divergence*cell:0);
+  }sum_partial(v);return;
+ }
+ if(op==46){if(!setup)return;vec4 v=global_reduce(false);if(i==0){c[35]=v.x;c[36]=v.y;c[37]=v.z;c[38]=v.w;if(v.y>0){c[7]=22;c[3]++;}}return;}
+ if(op==43){
+  if(i!=0)return;bool retry=c[7]==20||(c[7]>=10&&c[7]<=12);
+  if(retry&&c[29]<2){c[33]=c[7];c[34]=c[20];c[30]=c[20]*.5;c[29]++;c[7]=0;c[4]=0;c[5]=0;}
+  return;
+ }
+ if(op==41){sum_partial(i<N()?vec4(get_value(accepted(),i)*pc.spacing_dt.x*pc.spacing_dt.y*pc.spacing_dt.z,0,0,0):vec4(0));return;}
+ if(op==42){vec4 v=global_reduce(false);if(i==0)c[26]=v.x;return;}
+ if(op==20){ // accepted-state CFL with predicted gravity
+  if(!setup)return;float rate=i<N()?courant_at(coord(i,n),accepted(),true):0;
+  bounds_reduce(vec4(rate,rate,0,0));return;
+ }
+ if(op==21){
+  if(i!=0||!setup)return;float rate=0;for(uint k=0;k<(N()+127)/128;k++)rate=max(rate,partial[k].y);
+  c[20]=min(pc.spacing_dt.w,.45/max(rate,1e-20));if(c[29]>0)c[20]=min(c[20],c[30]);c[21]=0;c[22]=0;c[23]=0;c[39]=0;
+#ifdef COASTAL
+  for(int field=64;field<70;field++)c[field]=0;
+#endif
+  return;
+ }
+ if(op==22){
+  if(!setup)return;if(i<stride())put_value(candidate(),i,get_value(accepted(),i));
+  if(i<N())motion[N()+i]=get_value(accepted(),i)>.5?1:0;return;
+ }
+ if(op==23){if(setup&&i<N())geometry_plane[i]=transport_plane(coord(i,n));return;}
+ if(op==24){
+  if(!setup||i>=faces())return;ivec3 q;int axis;unpack_face(i,q,axis);
+  float amount=0;
+  if(axis==(int(c[2])+int(c[21]))%3&&!wall_face(q,axis)){
+   float velocity=old_face(q,axis),courant=face_courant(q,axis);ivec3 donor=q;if(velocity>0)donor[axis]--;
+   donor=wrap_cell(donor);float f=transport_f(donor),width=abs(courant);amount=f*width;
+   if(f>0&&f<1&&width>0){vec4 eq;
+#ifdef COASTAL
+    if(donor.x<0)eq=coastal_plane(donor,c[1]);else
+#endif
+    eq=geometry_plane[index3(donor,n)];vec3 low=vec3(0),extent=vec3(1);extent[axis]=width;if(velocity>0)low[axis]=1-width;amount=width*cube_volume(eq.xyz*extent,eq.w-dot(eq.xyz,low));}
+   amount*=sign(velocity);
+  }motion[flux_base()+i]=amount;return;
+ }
+ if(op==25){
+  if(!setup)return;vec4 v=vec4(1e20,-1e20,0,0);
+  if(i<N()){
+   ivec3 q=coord(i,n),r=q;int axis=(int(c[2])+int(c[21]))%3;r[axis]++;
+   precise float net=motion[flux_base()+face_local(q,axis)]-motion[flux_base()+face_local(r,axis)];
+   precise float correction=motion[N()+i]*(face_courant(r,axis)-face_courant(q,axis));
+   precise float increment=net+correction;
+   precise float f=transport_f(q)+increment;float change=0;
+   if(f>=-1e-6&&f<=1+1e-6)change=clamp(f,0,1)-f;
+   if(int(c[21])==1)motion[i]=f+change;else put_value(candidate(),i,f+change);
+   v=vec4(f,f,change,abs(change));if(isnan(f)||isinf(f))v.xy=vec2(-1e30,1e30);
+  }bounds_reduce(v);return;
+ }
+ if(op==26){
+  if(i!=0||!setup)return;vec4 v=vec4(1e20,-1e20,0,0);
+  for(uint k=0;k<(N()+127)/128;k++){v.x=min(v.x,partial[k].x);v.y=max(v.y,partial[k].y);v.zw+=partial[k].zw;}
+  uint step=uint(c[32])-1,sweep=uint(c[21]);if(step<uint(pc.fixture.w))history[step*4+sweep]=v;
+  float cell=pc.spacing_dt.x*pc.spacing_dt.y*pc.spacing_dt.z;c[22]+=v.z*cell;c[23]+=v.w*cell;
+  if(v.x< -1e-6||v.y>1+1e-6){c[7]=10+c[21];c[3]++;}c[21]++;return;
+ }
+ if(op==27||op==28){
+  if(!setup||i>=faces())return;ivec3 q;int axis;unpack_face(i,q,axis);
+  vec3 x=(vec3(q)+.5)*pc.spacing_dt.xyz;x[axis]-=.5*pc.spacing_dt[axis];bool valid;vec2 limits;
+  float value=0;
+  // Only accepted valid-band velocities can support a valid trace. Faces
+  // farther away are discarded by projection and rebuilt by air extension.
+  if(!wall_face(q,axis)&&((int(pc.numerics.w)&2)==0||motion[valid_base(accepted())+i]>.5)){
+   if((int(pc.numerics.w)&4)!=0)value=cached_advection(i,x,axis,dt,op==28);
+   else if(op==27)value=sampled_component(trace(x,dt),axis,false,valid,limits);
+   else{
+    float backward=sampled_component(trace(x,-dt),axis,true,valid,limits);bool valid_forward;vec2 donor_limits;
+    sampled_component(trace(x,dt),axis,false,valid_forward,donor_limits);
+    float forward=motion[forward_base()+i],corrected=forward+.5*(get_value(accepted(),U()+i)-backward);
+    value=valid&&valid_forward&&trace_supported(x,dt)&&trace_supported(x,-dt)&&corrected>=donor_limits.x&&corrected<=donor_limits.y?corrected:forward;
+   }
+  }
+  if(op==27)motion[forward_base()+i]=value;else put_value(candidate(),U()+i,value);return;
+ }
+ if(op==30){
+  if(c[4]<.5||c[6]<.5||c[7]>.5||i>=faces())return;ivec3 q;int axis;unpack_face(i,q,axis);ivec3 l=q;l[axis]--;
+  motion[source_base(0)+i]=!wall_face(q,axis)&&(wet(q)||wet(l))?float(i):-1;return;
+ }
+ if(op>=31&&op<=33){
+  if(c[4]<.5||c[6]<.5||c[7]>.5||i>=faces())return;int read_bank=(op-31)%2,write_bank=1-read_bank;
+  ivec3 q;int axis;unpack_face(i,q,axis);float source=motion[source_base(read_bank)+i],best=1e20;
+  if(!wall_face(q,axis)){
+   if(source>=0){ivec3 sq;int sa;unpack_face(uint(source),sq,sa);best=dot(periodic_delta(q,sq),periodic_delta(q,sq));}
+   for(int ax=0;ax<3;ax++)for(int sign=-1;sign<=1;sign+=2){
+    ivec3 neighbor=q;neighbor[ax]+=sign;neighbor=wrap_face(neighbor,axis);
+    if(!face_in_bounds(neighbor,axis)||wall_face(neighbor,axis))continue;
+    float candidate_source=motion[source_base(read_bank)+face_local(neighbor,axis)];if(candidate_source<0)continue;
+    ivec3 sq;int sa;unpack_face(uint(candidate_source),sq,sa);vec3 delta=periodic_delta(q,sq);float distance=dot(delta,delta);
+    if(distance<best||(distance==best&&candidate_source<source)){best=distance;source=candidate_source;}
+   }
+  }else source=-1;
+  motion[source_base(write_bank)+i]=source;return;
+ }
+ if(op==34){
+  if(c[4]<.5||c[6]<.5||c[7]>.5||i>=faces())return;ivec3 q;int axis;unpack_face(i,q,axis);ivec3 l=q;l[axis]--;
+  if(wet(q)||wet(l))return;float source=motion[source_base(1)+i];float value=source<0?0:extended_value(uint(source),q);put_value(candidate(),U()+i,value);return;
+ }
+ if(op==35){
+  if(c[4]<.5||c[6]<.5||c[7]>.5)return;float rate=i<N()?courant_at(coord(i,n),candidate(),false)*dt:0;bounds_reduce(vec4(rate,rate,0,0));return;
+ }
+ if(op==36){
+  if(i!=0||c[4]<.5||c[6]<.5||c[7]>.5)return;float rate=0;for(uint k=0;k<(N()+127)/128;k++)rate=max(rate,partial[k].y);c[27]=rate;
+  return;
+ }
+}

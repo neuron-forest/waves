@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cv52a21ntaov7"
+path="res://.godot/imported/pressure_hierarchy_state.glsl-02441064ca35da2580bd86a508c7500e.res"
+
+[deps]
+
+source_file="res://water/shaders/compute/pressure_hierarchy_state.glsl"
+dest_files=["res://.godot/imported/pressure_hierarchy_state.glsl-02441064ca35da2580bd86a508c7500e.res"]
+
+[params]
+

@@ -1,0 +1,237 @@
+// A fixed symmetric V-cycle. Fine A is unchanged; every coarse entry is P^T A P.
+// Upper-triangle storage is canonical even across short periodic dimensions.
+layout(local_size_x=128) in;
+layout(std430,set=0,binding=0) buffer FineWork {float work[];};
+#ifdef MG_BUILD
+layout(std430,set=0,binding=1) readonly buffer Geometry {vec2 geo[];};
+#endif
+layout(std430,set=0,binding=2) buffer Control {float c[];};
+layout(std430,set=0,binding=3) readonly buffer Levels {int meta[];};
+layout(std430,set=0,binding=4) buffer Matrices {uint matrix[];};
+layout(std430,set=0,binding=5) buffer Vectors {float v[];};
+#ifndef MG_BUILD
+layout(std430,set=0,binding=7) buffer Partials {vec4 partial[];};
+#endif
+layout(std430,set=0,binding=8) buffer CachedRows {vec2 rows[];};
+#ifdef MG_CACHE
+layout(std430,set=0,binding=9) readonly buffer FineSnapshot {float cached_fine[];};
+layout(std430,set=0,binding=10) buffer TransferCache {vec2 transfer_cache[];};
+#ifdef MG_BUILD
+layout(std430,set=0,binding=11) buffer Maintenance {uint state[];};
+#endif
+#endif
+layout(push_constant,std430) uniform Parameters {ivec4 run;ivec4 settings;} pc;
+// run=operation,level,phase(0 setup/1 iteration/2 hierarchy),vector fields.
+// settings=level count,periodic x,smoother degree,reserved.
+#ifndef MG_BUILD
+shared vec4 reduce_work[128];
+#endif
+int md(int l,int k){return meta[16*l+k];}
+ivec3 dims(int l){return ivec3(md(l,0),md(l,1),md(l,2));}
+int count(int l){return md(l,8);}
+int at(int l,int field,int i){return 8*md(l,3)+field*count(l)+i;}
+int positive_mod(int x,int n){return x>=0?x%n:(n-1)-((-1-x)%n);}
+ivec3 coord(int i,ivec3 n){return ivec3(i%n.x,(i/n.x)%n.y,i/(n.x*n.y));}
+int index3(ivec3 q,ivec3 n){return q.x+n.x*(q.y+n.y*q.z);}
+int wrap(int l,ivec3 q){
+ ivec3 n=dims(l);q.z=positive_mod(q.z,n.z);
+ if(pc.settings.y!=0)q.x=positive_mod(q.x,n.x);
+ if(q.x<0||q.x>=n.x||q.y<0||q.y>=n.y)return -1;
+ return index3(q,n);
+}
+ivec3 delta(int l,int i,int j){
+ ivec3 n=dims(l),d=coord(j,n)-coord(i,n);
+ if(pc.settings.y!=0)d.x=positive_mod(d.x+n.x/2,n.x)-n.x/2;
+ d.z=positive_mod(d.z+n.z/2,n.z)-n.z/2;
+ return d;
+}
+int slot(ivec3 d){return d.x+2+5*(d.y+2+5*(d.z+2));}
+ivec3 offset(int l,int k){int start=md(l,10)+3*k;return ivec3(meta[start],meta[start+1],meta[start+2]);}
+bool enabled(){
+ if(c[7]>.5)return false;
+ if(pc.run.z==2){
+  if(c[5]<.5)return false;
+#ifdef MG_CACHE
+#ifdef MG_BUILD
+  if(pc.run.x==1)return state[9]!=0;
+  if(pc.run.x==16)return state[14]==0||state[20+pc.run.y+1]!=0;
+  return state[8]!=0;
+#endif
+#endif
+  return true;
+ }
+ if(pc.run.z==0)return (c[5]>.5||(pc.settings.w!=0&&c[57]==2))&&c[6]<.5;
+ return c[4]>.5&&c[6]<.5;
+}
+bool active_cell(int l,int i){return i>=0&&v[at(l,3,i)]>.5;}
+float fine_coefficient(int field,int i){
+#ifdef MG_CACHE
+ return cached_fine[(field-6)*count(0)+i];
+#else
+ return work[field*count(0)+i];
+#endif
+}
+float coefficient(int l,int i,int j){
+ if(j<0)return 0;
+ if(!active_cell(l,i)||!active_cell(l,j))return i==j?1:0;
+ if(l==0){
+  int N=count(0);if(i==j)return fine_coefficient(12,i);
+  ivec3 q=coord(i,dims(0));float value=0;
+  for(int axis=0;axis<3;axis++)for(int side=0;side<2;side++){
+   ivec3 nb=q;nb[axis]+=2*side-1;
+   if(wrap(0,nb)==j)value-=fine_coefficient(6+2*axis+side,i);
+  }return value;
+ }
+ int a=min(i,j),b=max(i,j);ivec3 d=delta(l,a,b);
+ if(any(greaterThan(abs(d),ivec3(2))))return 0;
+ return uintBitsToFloat(matrix[md(l,4)+125*a+slot(d)]);
+}
+bool unique_neighbor(int l,int i,ivec3 off,int j){return j>=0&&all(equal(delta(l,i,j),off));}
+float apply(int l,int field,int i){
+ if(!active_cell(l,i))return v[at(l,field,i)];
+ float sum=0;ivec3 q=coord(i,dims(l));
+ if(l==0){
+  float here=v[at(l,field,i)];int N=count(0);
+  for(int axis=0;axis<3;axis++)for(int side=0;side<2;side++){
+   ivec3 nb=q;nb[axis]+=2*side-1;int j=wrap(l,nb);
+   float other=active_cell(l,j)?v[at(l,field,j)]:0;
+   sum+=fine_coefficient(6+2*axis+side,i)*(here-other);
+  }return sum;
+ }
+ int width=md(l,11),N=count(l),start=md(l,12)+i;
+ for(int k=0;k<width;k++){
+  vec2 entry=rows[start+k*N];sum+=entry.x*v[at(l,field,floatBitsToInt(entry.y))];
+ }return sum;
+}
+// Cell-centered trilinear basis; coarsened dimensions have factors 1 or 2.
+// Bottom/side Neumann extension clamps; the top correction is homogeneous zero.
+int compute_transfers(int l,int i,out int ids[8],out float weights[8]){
+ ivec3 n=dims(l+1),f=ivec3(md(l,5),md(l,6),md(l,7)),q=coord(i,dims(l));
+ if(md(l,15)!=0){int j=index3(q/f,n);if(!active_cell(l+1,j))return 0;ids[0]=j;weights[0]=1;return 1;}
+ vec3 pos=(vec3(q)+.5)/vec3(f)-.5;ivec3 base=ivec3(floor(pos));vec3 t=fract(pos);int size=0;
+ for(int z=0;z<f.z;z++)for(int y=0;y<f.y;y++)for(int x=0;x<f.x;x++){
+  ivec3 bit=ivec3(x,y,z),nb=base+bit;float w=1;
+  for(int axis=0;axis<3;axis++)if(f[axis]>1)w*=bit[axis]==1?t[axis]:1-t[axis];
+  if(nb.y>=n.y)continue;nb.y=max(nb.y,0);
+  nb.x=pc.settings.y!=0?positive_mod(nb.x,n.x):clamp(nb.x,0,n.x-1);nb.z=positive_mod(nb.z,n.z);
+  int j=index3(nb,n);if(!active_cell(l+1,j)||w==0)continue;
+  ids[size]=j;weights[size]=w;size++;
+ }return size;
+}
+int transfers(int l,int i,out int ids[8],out float weights[8]){
+#ifdef MG_CACHE
+ int size=0;for(int k=0;k<md(l,14);k++){vec2 entry=transfer_cache[md(l,13)+k*count(l)+i];if(entry.y>0){ids[size]=floatBitsToInt(entry.x);weights[size]=entry.y;size++;}}return size;
+#else
+ return compute_transfers(l,i,ids,weights);
+#endif
+}
+void add_entry(int l,int i,int j,float value){
+ if(value==0)return;int a=min(i,j),b=max(i,j);ivec3 d=delta(l,a,b);
+ // A radius-two box is closed under these transfers. Never truncate a coupling.
+ if(any(greaterThan(abs(d),ivec3(2)))){c[7]=31;return;}
+ int address=md(l,4)+125*a+slot(d);uint old=matrix[address];
+ for(;;){uint observed=atomicCompSwap(matrix[address],old,floatBitsToUint(uintBitsToFloat(old)+value));if(observed==old)break;old=observed;}
+}
+void main(){
+ int i=int(gl_GlobalInvocationID.x+gl_WorkGroupID.y*gl_NumWorkGroups.x*128),lid=int(gl_LocalInvocationID.x),op=pc.run.x,l=pc.run.y,N=count(l);
+ if(!enabled())return;
+ #ifdef MG_BUILD
+ if(op==1){ // classify active coarse basis functions from fine children
+  if(i>=N)return;float value=0;
+  if(l==0)value=geo[i].y>.5?1:0;
+  else{
+   ivec3 f=ivec3(md(l-1,5),md(l-1,6),md(l-1,7)),base=coord(i,dims(l))*f;
+   for(int z=0;z<f.z;z++)for(int y=0;y<f.y;y++)for(int x=0;x<f.x;x++)if(active_cell(l-1,wrap(l-1,base+ivec3(x,y,z))))value=1;
+  }
+#ifdef MG_CACHE
+  if(v[at(l,3,i)]!=value)atomicAdd(state[20+l],1);
+#endif
+  v[at(l,3,i)]=value;return;
+ }
+#ifdef MG_CACHE
+ if(op==16){
+  if(i>=N)return;int ids[8];float weights[8];int size=compute_transfers(l,i,ids,weights);
+  for(int k=0;k<md(l,14);k++)transfer_cache[md(l,13)+k*N+i]=k<size?vec2(intBitsToFloat(ids[k]),weights[k]):vec2(0);
+  return;
+ }
+#endif
+ if(op==2){if(i<N*125)matrix[md(l,4)+i]=0;return;}
+ if(op==3){ // sparse symmetric Galerkin scatter, one authoritative triangle
+  int width=md(l,11),row=i/width,k=i%width;if(row>=N||!active_cell(l,row))return;
+  ivec3 q=coord(row,dims(l)),off=offset(l,k);
+  int col=wrap(l,q+off);if(col<row||!active_cell(l,col))return;
+  if(l>0&&!unique_neighbor(l,row,off,col))return;
+  float aij;
+  if(l==0){ // retain duplicate periodic faces individually on a two-cell axis
+   aij=k==0?fine_coefficient(12,row):-fine_coefficient(5+k,row);
+  }else aij=coefficient(l,row,col);
+  if(aij==0)return;
+  int left[8],right[8];float wl[8],wr[8];int nl=transfers(l,row,left,wl),nr=transfers(l,col,right,wr);
+  for(int a=0;a<nl;a++)for(int b=0;b<nr;b++){
+   if(row==col&&left[a]>right[b])continue;
+   float value=aij*wl[a]*wr[b];if(row!=col&&left[a]==right[b])value*=2;
+   add_entry(l+1,left[a],right[b],value);
+  }return;
+ }
+ if(op==13){
+  if(i>=N)return;int width=md(l,11),start=md(l,12)+i;ivec3 q=coord(i,dims(l));
+  for(int k=0;k<width;k++){
+   ivec3 off=offset(l,k);int j=wrap(l,q+off);float a=unique_neighbor(l,i,off,j)?coefficient(l,i,j):0;
+   rows[start+k*N]=vec2(a,intBitsToFloat(max(j,0)));
+  }return;
+ }
+ if(op==4){ // l1 Jacobi is SPD; spectral radius(S A) <= 1 at every level
+  if(i>=N)return;float sum=0;ivec3 q=coord(i,dims(l));
+  if(l==0){sum=fine_coefficient(12,i);for(int axis=0;axis<3;axis++)for(int side=0;side<2;side++){ivec3 nb=q;nb[axis]+=2*side-1;if(active_cell(0,wrap(0,nb)))sum+=fine_coefficient(6+2*axis+side,i);}}
+  else for(int k=0;k<md(l,11);k++){ivec3 off=offset(l,k);int j=wrap(l,q+off);if(unique_neighbor(l,i,off,j))sum+=abs(coefficient(l,i,j));}
+  if(!(sum>0)||isnan(sum)||isinf(sum)){c[7]=32;return;}
+  v[at(l,4,i)]=1/sum;return;
+ }
+ #else
+ if(op==5){if(i<N){v[at(l,0,i)]=work[i];v[at(l,1,i)]=0;v[at(l,2,i)]=0;}return;}
+ if(op==15){ // Fourth-kind Chebyshev, lambda_max(S A)<=1 by l1 scaling.
+  if(i>=N)return;int source=pc.run.w%4,k=pc.run.w/4;float r=v[at(l,0,i)]-apply(l,source,i);
+  float d=(k==1?0:float(2*k-3)/float(2*k+1)*v[at(l,7,i)])+float(8*k-4)/float(2*k+1)*v[at(l,4,i)]*r;
+  v[at(l,7,i)]=d;v[at(l,3-source,i)]=v[at(l,source,i)]+d;return;
+ }
+ if(op==14){if(i<N)v[at(l,2,i)]=v[at(l,4,i)]*v[at(l,0,i)];return;}
+ if(op==6){if(i<N){int source=pc.run.w,dest=3-source;v[at(l,dest,i)]=v[at(l,source,i)]+v[at(l,4,i)]*(v[at(l,0,i)]-apply(l,source,i));}return;}
+ if(op==7){if(i<N)v[at(l,6,i)]=v[at(l,0,i)]-apply(l,pc.run.w,i);return;}
+ if(op==8){ // exact P^T residual gather, including clamped/wrapped weights
+  if(i>=N)return;float sum=0;int parent=l-1;ivec3 f=ivec3(md(parent,5),md(parent,6),md(parent,7)),nf=dims(parent),qc=coord(i,dims(l));
+  if(md(parent,15)!=0){
+   if(active_cell(l,i))for(int z=0;z<f.z;z++)for(int y=0;y<f.y;y++)for(int x=0;x<f.x;x++){
+    int j=wrap(parent,qc*f+ivec3(x,y,z));if(active_cell(parent,j))sum+=v[at(parent,6,j)];
+   }
+   v[at(l,0,i)]=sum;v[at(l,1,i)]=0;v[at(l,2,i)]=0;return;
+  }
+  ivec3 lo=qc*f,extent=ivec3(1);
+  for(int axis=0;axis<3;axis++)if(f[axis]>1){lo[axis]--;extent[axis]=4;if((axis==2||(axis==0&&pc.settings.y!=0))&&nf[axis]<=4){lo[axis]=0;extent[axis]=nf[axis];}}
+  if(active_cell(l,i))for(int z=0;z<extent.z;z++)for(int y=0;y<extent.y;y++)for(int x=0;x<extent.x;x++){
+   int j=wrap(parent,lo+ivec3(x,y,z));if(!active_cell(parent,j))continue;
+   ivec3 q=coord(j,nf),nc=dims(l);vec3 pos=(vec3(q)+.5)/vec3(f)-.5;ivec3 base=ivec3(floor(pos));vec3 t=fract(pos);float weight=1;
+   for(int axis=0;axis<3;axis++){
+    float w=0;for(int bit=0;bit<f[axis];bit++){
+     int nb=base[axis]+bit;
+     if(axis==2||(axis==0&&pc.settings.y!=0))nb=positive_mod(nb,nc[axis]);
+     else if(axis==0)nb=clamp(nb,0,nc[axis]-1);else nb=max(nb,0);
+     if(nb==qc[axis])w+=f[axis]==1?1:(bit==1?t[axis]:1-t[axis]);
+    }weight*=w;
+   }
+   sum+=weight*v[at(parent,6,j)];
+  }
+  v[at(l,0,i)]=sum;v[at(l,1,i)]=0;v[at(l,2,i)]=0;return;
+ }
+ if(op==9){
+  if(i>=N)return;float add=0;int fine_field=pc.run.w%4,coarse_field=pc.run.w/4;
+  if(active_cell(l,i)){int ids[8];float ws[8];int size=transfers(l,i,ids,ws);for(int k=0;k<size;k++)add+=ws[k]*v[at(l+1,coarse_field,ids[k])];}
+  v[at(l,fine_field,i)]+=add;return;
+ }
+ if(op==10){
+  vec4 value=vec4(0);if(i<N){float r=work[i],z=v[at(0,pc.run.w,i)],b=work[5*N+i];work[N+i]=z;if(pc.run.z==0)work[2*N+i]=z;value=vec4(r*z,r*r,b*b,abs(r));}
+  reduce_work[lid]=value;barrier();for(int s=64;s>0;s>>=1){if(lid<s){reduce_work[lid].xyz+=reduce_work[lid+s].xyz;reduce_work[lid].w=max(reduce_work[lid].w,reduce_work[lid+s].w);}barrier();}
+  if(lid==0)partial[gl_WorkGroupID.x]=reduce_work[0];return;
+ }
+
+ #endif
+}

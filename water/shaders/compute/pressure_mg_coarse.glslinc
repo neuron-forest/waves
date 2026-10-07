@@ -1,0 +1,54 @@
+layout(local_size_x=128) in;
+layout(std430,set=0,binding=2) buffer Control {float c[];};
+layout(std430,set=0,binding=3) readonly buffer Levels {int meta[];};
+layout(std430,set=0,binding=4) buffer Matrices {uint matrix[];};
+layout(std430,set=0,binding=5) buffer Vectors {float v[];};
+#ifdef MG_CACHE
+layout(std430,set=0,binding=11) readonly buffer Maintenance {uint state[];};
+#endif
+layout(push_constant,std430) uniform Parameters {ivec4 run;ivec4 settings;} pc;
+shared float dense[4096];shared float inverse_l[4096];shared float small_rhs[64];
+int md(int l,int k){return meta[16*l+k];}
+ivec3 dims(int l){return ivec3(md(l,0),md(l,1),md(l,2));}
+int count(int l){return md(l,8);}
+int at(int l,int field,int i){return 8*md(l,3)+field*count(l)+i;}
+ivec3 coord(int i,ivec3 n){return ivec3(i%n.x,(i/n.x)%n.y,i/(n.x*n.y));}
+int modp(int x,int n){return x>=0?x%n:(n-1)-((-1-x)%n);}
+float coefficient(int l,int i,int j){
+ if(v[at(l,3,i)]<.5||v[at(l,3,j)]<.5)return i==j?1:0;
+ int a=min(i,j),b=max(i,j);ivec3 n=dims(l),d=coord(b,n)-coord(a,n);
+ if(pc.settings.y!=0)d.x=modp(d.x+n.x/2,n.x)-n.x/2;d.z=modp(d.z+n.z/2,n.z)-n.z/2;
+ if(any(greaterThan(abs(d),ivec3(2))))return 0;
+ return uintBitsToFloat(matrix[md(l,4)+125*a+d.x+2+5*(d.y+2+5*(d.z+2))]);
+}
+void main(){
+ int i=int(gl_GlobalInvocationID.x),lid=int(gl_LocalInvocationID.x),op=pc.run.x,l=pc.run.y,N=count(l);
+ if(c[7]>.5)return;
+ if(pc.run.z==2){if(c[5]<.5)return;
+#ifdef MG_CACHE
+ if(state[8]==0)return;
+#endif
+ }
+ else if(pc.run.z==0){if((c[5]<.5&&(pc.settings.w==0||c[57]!=2))||c[6]>.5)return;}
+ else if(c[4]<.5||c[6]>.5)return;
+ if(op==11){ // exact small SPD coarse factor, once per geometry update
+  for(int k=lid;k<N*N;k+=128)dense[k]=coefficient(l,k/N,k%N);barrier();
+  for(int k=0;k<N;k++){
+   if(lid==0){float d=dense[k*N+k];for(int j=0;j<k;j++)d-=dense[k*N+j]*dense[k*N+j];if(!(d>0)||isnan(d)||isinf(d)){c[7]=33;d=1;}dense[k*N+k]=sqrt(d);}
+   barrier();
+   if(lid>k&&lid<N){float d=dense[lid*N+k];for(int j=0;j<k;j++)d-=dense[lid*N+j]*dense[k*N+j];dense[lid*N+k]=d/dense[k*N+k];}
+   barrier();
+  }
+  // Store L^-1, so each application is the explicitly symmetric B^T B.
+  // Only this once-per-geometry construction uses triangular recurrences.
+  for(int row=0;row<N;row++){
+   if(lid<N){float d=lid==row?1:0;for(int j=0;j<row;j++)d-=dense[row*N+j]*inverse_l[j*N+lid];inverse_l[row*N+lid]=d/dense[row*N+row];}barrier();
+  }
+  for(int k=lid;k<N*N;k+=128)matrix[md(l,9)+k]=floatBitsToUint(inverse_l[k]);return;
+ }
+ if(op==12){ // no data-dependent coarse stopping: triangular solves are fixed
+  if(lid<N){float d=0;for(int j=0;j<=lid;j++)d+=uintBitsToFloat(matrix[md(l,9)+lid*N+j])*v[at(l,0,j)];small_rhs[lid]=d;}barrier();
+  if(lid<N){float d=0;for(int j=lid;j<N;j++)d+=uintBitsToFloat(matrix[md(l,9)+j*N+lid])*small_rhs[j];v[at(l,1,lid)]=d;}
+  return;
+ }
+}

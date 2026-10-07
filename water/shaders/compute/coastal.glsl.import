@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://b1eocwarisq1s"
+path="res://.godot/imported/coastal.glsl-e0289e367e9484d1392b30e7d0158b72.res"
+
+[deps]
+
+source_file="res://water/shaders/compute/coastal.glsl"
+dest_files=["res://.godot/imported/coastal.glsl-e0289e367e9484d1392b30e7d0158b72.res"]
+
+[params]
+

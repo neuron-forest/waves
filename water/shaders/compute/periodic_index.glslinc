@@ -1,0 +1,6 @@
+// GLSL integer % requires nonnegative operands. Handle INT_MIN without overflow.
+// The divisor n must be positive.
+int periodic_index(int q,int n){
+ if(q>=0)return q%n;
+ return n-1-((-1-q)%n);
+}

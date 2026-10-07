@@ -1,0 +1,158 @@
+layout(local_size_x=128) in;
+layout(std430,set=0,binding=0) buffer BankA { float a[]; };
+layout(std430,set=0,binding=1) buffer BankB { float b[]; };
+layout(std430,set=0,binding=2) buffer Scratch { float work[]; };
+layout(std430,set=0,binding=3) buffer Geometry { vec2 geo[]; }; // signed phi, kind (-1 solid,0 air,1 wet)
+layout(std430,set=0,binding=4) buffer Partials { vec4 partial[]; };
+layout(std430,set=0,binding=5) buffer Control { float c[]; };
+#ifndef PCG_ONLY
+layout(rgba32f,set=0,binding=6) uniform writeonly image3D planes;
+layout(r32f,set=0,binding=7) uniform writeonly image3D kinds;
+layout(std430,set=0,binding=8) buffer Reconstructed { vec4 geometry_plane[]; };
+#endif
+layout(push_constant,std430) uniform Params { vec4 dims_op; vec4 spacing_dt; vec4 origin_eta; vec4 options;
+#ifdef COUPLED
+ vec4 fixture;
+ vec4 wave; // amplitude, k, omega, mean depth
+ vec4 numerics; // relative tolerance, extension mode, Stokes-2, flags: bit0 height normals, bit1 valid-band advection
+#ifdef COASTAL
+ vec4 forcing; // offshore x, zone length, maximum rate / s, ramp periods
+#endif
+#endif
+} pc;
+// options: periodic_x, bed_slope_denominator (0 => bottom plane), corrugation, quota: nonnegative accepted steps, negative absolute accepted-time deadline.
+// Control: bank,time,accepted,rejected,pending,setup,converged,failure,iters,rho,b2,alpha,beta,relres,div,speed,p_error,volume,total_iters,inject_rejection.
+shared vec4 reduction[128];
+ivec3 dims(){return ivec3(pc.dims_op.xyz);}
+uint N(){ivec3 n=dims();return uint(n.x*n.y*n.z);}
+uint NU(){ivec3 n=dims();return uint((n.x+1)*n.y*n.z);}
+uint NV(){ivec3 n=dims();return uint(n.x*(n.y+1)*n.z);}
+uint NW(){ivec3 n=dims();return uint(n.x*n.y*(n.z+1));}
+uint U(){return N();} uint V(){return N()+NU();} uint W(){return N()+NU()+NV();} uint P(){return N()+NU()+NV()+NW();}
+uint stride(){return P()+N();}
+uint index3(ivec3 q,ivec3 n){return uint(q.x+n.x*(q.y+n.y*q.z));}
+ivec3 coord(uint i,ivec3 n){return ivec3(int(i)%n.x,(int(i)/n.x)%n.y,int(i)/(n.x*n.y));}
+float get_value(int bank,uint i){return bank==0?a[i]:b[i];}
+void put_value(int bank,uint i,float v){if(bank==0)a[i]=v;else b[i]=v;}
+float timestep(){
+#ifdef COUPLED
+ return c[20];
+#else
+ return pc.spacing_dt.w;
+#endif
+}
+int accepted(){return int(c[0]);} int candidate(){return 1-accepted();}
+int geometry_bank(){
+#ifdef COUPLED
+ return (int(pc.dims_op.w)==19||c[4]<.5)?accepted():candidate();
+#else
+ return accepted();
+#endif
+}
+float eta(ivec3 q){
+#ifdef COUPLED
+ if(pc.fixture.x==5){
+  float phase=pc.wave.y*(pc.origin_eta.x+(float(q.x)+.5)*pc.spacing_dt.x);
+  float sigma=tanh(pc.wave.y*pc.wave.w);
+  float second=pc.numerics.z>.5?pc.wave.y*pc.wave.x*pc.wave.x*(3-sigma*sigma)/(4*sigma*sigma*sigma):0;
+  return pc.origin_eta.w+pc.wave.x*cos(phase)+second*cos(2*phase);
+ }
+#endif
+ return pc.origin_eta.w+pc.options.z*cos(6.28318530718*(float(q.x)+0.5)/float(dims().x));
+}
+vec3 center(ivec3 q){return pc.origin_eta.xyz+(vec3(q)+0.5)*pc.spacing_dt.xyz;}
+ivec3 wrap_cell(ivec3 q){ivec3 n=dims();q.z=periodic_index(q.z,n.z);if(pc.options.x>0.5)q.x=periodic_index(q.x,n.x);return q;}
+bool outside(ivec3 q){ivec3 n=dims();return q.x<0||q.x>=n.x||q.y<0||q.y>=n.y;}
+bool solid(ivec3 q){
+ q=wrap_cell(q);ivec3 n=dims();
+ if(q.y<0||q.x>=n.x)return true;
+#ifndef COASTAL
+ if(q.x<0)return true;
+#endif
+ if(q.y>=n.y)return false;
+ if(pc.options.y>0.0){float x=center(q).x;float bed=-0.45+max(0.0,x-1.5)/pc.options.y;return center(q).y<=bed;}
+ return false;
+}
+bool wet(ivec3 q){q=wrap_cell(q);return !outside(q)&&geo[index3(q,dims())].y>0.5;}
+float phi(ivec3 q){q=wrap_cell(q);return outside(q)?center(q).y-eta(q):geo[index3(q,dims())].x;}
+float press(ivec3 q){q=wrap_cell(q);return wet(q)?get_value(candidate(),P()+index3(q,dims())):0.0;}
+float distance_face(ivec3 l,ivec3 r,int axis){
+ float h=pc.spacing_dt[axis];
+ // The top boundary is atmospheric outflow
+ // boundary, located on the domain face. This is not an interface fallback.
+ if(axis==1&&(l.y>=dims().y||r.y>=dims().y))return .5*h;
+ bool wl=wet(l),wr=wet(r);
+ if(wl&&wr)return h;
+ float pl=abs(phi(l)),pr=abs(phi(r));
+ return h*max((wl?pl:pr)/max(pl+pr,1e-30),1e-6);
+}
+float coefficient(ivec3 q,ivec3 nb,int axis){
+ if(solid(nb))return 0.0;
+#ifdef COASTAL
+ // Prescribed ocean normal flux: homogeneous pressure-correction Neumann.
+ // The free surface supplies the pressure Dirichlet condition.
+ if(axis==0&&nb.x<0)return 0.0;
+#endif
+ return 1.0/(pc.spacing_dt[axis]*distance_face(q,nb,axis));
+}
+float vector_at(ivec3 q,int which){q=wrap_cell(q);if(!wet(q))return 0.0;uint i=index3(q,dims());return which==0?press(q):work[2*N()+i];}
+float operator_at(ivec3 q,int which){
+ float result=0,here=vector_at(q,which);uint i=index3(q,dims());
+ int face=0;
+ for(int axis=0;axis<3;axis++)for(int sign=-1;sign<=1;sign+=2){ivec3 nb=q;nb[axis]+=sign;float k=work[uint(6+face)*N()+i];result+=k*(here-vector_at(nb,which));face++;}
+ return result;
+}
+float diagonal(ivec3 q){return work[12*N()+index3(q,dims())];}
+// Periodic boundary faces are one physical degree of freedom. All operators
+// address the canonical face; duplicate storage is synchronized for publication.
+uint face_index(ivec3 q,int axis){
+ ivec3 n=dims();if(axis==2&&q.z==n.z)q.z=0;
+ if(axis==0&&pc.options.x>.5&&q.x==n.x)q.x=0;
+ n[axis]++;return (axis==0?U():(axis==1?V():W()))+index3(q,n);
+}
+float divergence(ivec3 q){float d=0;for(int axis=0;axis<3;axis++){ivec3 right=q;right[axis]++;d+=(get_value(candidate(),face_index(right,axis))-get_value(candidate(),face_index(q,axis)))/pc.spacing_dt[axis];}return d;}
+void sum_partial(vec4 value){uint lid=gl_LocalInvocationID.x;reduction[lid]=value;barrier();for(uint offset=64;offset>0;offset>>=1){if(lid<offset)reduction[lid]+=reduction[lid+offset];barrier();}if(lid==0)partial[gl_WorkGroupID.x]=reduction[0];}
+vec4 sum_all(){vec4 result=vec4(0);for(uint k=0;k<(N()+127)/128;k++)result+=partial[k];return result;}
+// L2 convergence alone does not bound local incompressibility at small theta.
+// Residual r implies dt*div(u_projected) = -dt^2/rho * r.
+void pressure_partial(vec4 value){
+ uint lid=gl_LocalInvocationID.x;reduction[lid]=value;barrier();
+ for(uint offset=64;offset>0;offset>>=1){if(lid<offset){reduction[lid].xyz+=reduction[lid+offset].xyz;reduction[lid].w=max(reduction[lid].w,reduction[lid+offset].w);}barrier();}
+ if(lid==0)partial[gl_WorkGroupID.x]=reduction[0];
+}
+// Second-stage reduction uses all 128 lanes, rather than serializing every
+// workgroup partial through one invocation. Call uniformly in a single group.
+vec4 global_reduce(bool max_w){
+ uint lid=gl_LocalInvocationID.x;vec4 value=vec4(0);
+ for(uint k=lid;k<(N()+127)/128;k+=128){value.xyz+=partial[k].xyz;value.w=max_w?max(value.w,partial[k].w):value.w+partial[k].w;}
+ reduction[lid]=value;barrier();
+ for(uint offset=64;offset>0;offset>>=1){
+  if(lid<offset){reduction[lid].xyz+=reduction[lid+offset].xyz;reduction[lid].w=max_w?max(reduction[lid].w,reduction[lid+offset].w):reduction[lid].w+reduction[lid+offset].w;}
+  barrier();
+ }
+ return reduction[0];
+}
+bool pressure_setup(){
+#ifdef COUPLED
+ return c[5]>.5||c[57]==2;
+#else
+ return c[5]>.5;
+#endif
+}
+float pressure_tolerance(){
+#ifdef COUPLED
+ return pc.numerics.x;
+#else
+ return 1e-4;
+#endif
+}
+// Near a zero RHS, use a declared absolute integrated-divergence L2 norm.
+// This avoids demanding sub-ULP corrections to an already uniform float velocity.
+// Both thresholds are resolution-independent L2 bounds, not diluted by air count.
+float pressure_scaled_norm(float squared){return timestep()*timestep()/1000*sqrt(max(squared,0));}
+bool pressure_norm_converged(float residual2,float rhs2){
+ return residual2<=pressure_tolerance()*pressure_tolerance()*rhs2 ||
+  (pressure_scaled_norm(rhs2)<=1e-5 && pressure_scaled_norm(residual2)<=1e-8);
+}
+bool residual_converged(vec4 sums,float rhs2){return pressure_norm_converged(sums.y,rhs2)&&timestep()*timestep()/1000*sums.w<5e-5;}
+bool solving(){return c[4]>0.5&&c[6]<0.5&&c[7]<0.5;}

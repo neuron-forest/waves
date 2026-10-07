@@ -1,0 +1,37 @@
+// Independent closed-form cube/halfspace integration. Local cell is [0,1]^3.
+// Sort positive coefficients; symmetry and factored differences avoid cancellation.
+float cube_volume(vec3 normal,float alpha){
+ alpha-=min(normal.x,0.0)+min(normal.y,0.0)+min(normal.z,0.0);
+ vec3 v=abs(normal);float total=v.x+v.y+v.z;
+ if(alpha<=0.0)return 0.0;if(alpha>=total)return 1.0;
+ if(v.x>v.y){float t=v.x;v.x=v.y;v.y=t;}if(v.y>v.z){float t=v.y;v.y=v.z;v.z=t;}if(v.x>v.y){float t=v.x;v.x=v.y;v.y=t;}
+ bool complement=alpha>0.5*total;float t=complement?total-alpha:alpha;
+ float x=v.x,y=v.y,z=v.z,result;
+ if(x<1e-6*total){
+  t-=x*0.5;
+  if(y<1e-6*total)result=(t-y*0.5)/z;
+  else if(t<y)result=t*t/(2*y*z);
+  else result=(t-0.5*y)/z;
+ }else if(t<x)result=t*t*t/(6*x*y*z);
+ else if(t<y)result=(3*t*t-3*t*x+x*x)/(6*y*z);
+ else if(x+y<z && t>=x+y)result=(t-0.5*(x+y))/z;
+ else{
+  float numerator=x*(3*t*t-3*t*x+x*x)-pow(max(t-y,0.0),3.0)-pow(max(t-z,0.0),3.0);
+  result=numerator/(6*x*y*z);
+ }
+ return complement?1.0-result:result;
+}
+float inverse_volume(vec3 normal,float fraction){
+ float lo=min(normal.x,0.0)+min(normal.y,0.0)+min(normal.z,0.0);
+ float hi=max(normal.x,0.0)+max(normal.y,0.0)+max(normal.z,0.0);
+ for(int iteration=0;iteration<25;iteration++){float mid=0.5*(lo+hi);if(cube_volume(normal,mid)<fraction)lo=mid;else hi=mid;}
+ float alpha=0.5*(lo+hi),center=dot(normal,vec3(.5));
+ // Central symmetry fixes the exact half-volume tie. Bisection can otherwise
+ // round an F just above 1/2 back onto the center. Move only that rounded plane
+ // by one unit-scale float spacing; F is never changed. Keep geometry-derived
+ // classification consistent with the frozen compression indicator.
+ if(fraction==.5)return center;
+ if(fraction<.5)return min(alpha,center);
+ if(alpha<=center)alpha=center+5.96046448e-8*dot(abs(normal),vec3(1));
+ return alpha;
+}

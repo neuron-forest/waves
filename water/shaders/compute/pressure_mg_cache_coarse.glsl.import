@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://g80t80vwxepq"
+path="res://.godot/imported/pressure_mg_cache_coarse.glsl-79bf821f70e004124655635c5f991f25.res"
+
+[deps]
+
+source_file="res://water/shaders/compute/pressure_mg_cache_coarse.glsl"
+dest_files=["res://.godot/imported/pressure_mg_cache_coarse.glsl-79bf821f70e004124655635c5f991f25.res"]
+
+[params]
+

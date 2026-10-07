@@ -1,0 +1,81 @@
+layout(std430,set=0,binding=12) buffer TargetProbe { vec4 target_probe[]; };
+layout(std430,set=0,binding=13) buffer CoastalHistory { vec4 coastal_history[]; };
+// c64..69 staged forcing volume, ocean in/out, forcing momentum xyz.
+// c72..77 committed counterparts. c80..87 gauges outside relaxation regions.
+// Top outflow and roundoff retain the base coupled solver's distinct ledgers.
+vec3 cell_velocity(int bank,ivec3 q){
+ vec3 velocity;for(int axis=0;axis<3;axis++){ivec3 r=q;r[axis]++;velocity[axis]=.5*(get_value(bank,face_index(q,axis))+get_value(bank,face_index(r,axis)));}return velocity;
+}
+void coastal_pass(){
+ uint i=gl_GlobalInvocationID.x;int op=int(pc.dims_op.w);ivec3 n=dims();
+ bool setup=c[5]>.5&&c[7]<.5;float time=c[1]+timestep();
+ float cell=pc.spacing_dt.x*pc.spacing_dt.y*pc.spacing_dt.z;
+ if(op==80){
+  if(!setup)return;vec4 change=vec4(0);
+  if(i<N()){
+   ivec3 q=coord(i,n);
+   if(!solid(q)){
+    float old=get_value(candidate(),i),rate=coastal_rate(center(q).x);
+    float target=offshore_zone(center(q).x)?coastal_fraction(q,time):clamp(.5-center(q).y/pc.spacing_dt.y,0,1);
+    float value=old+(1-exp(-rate*timestep()))*(target-old);put_value(candidate(),i,value);
+    change=vec4((value-old)*cell,1000*(value-old)*cell*cell_velocity(candidate(),q));
+   }
+  }sum_partial(change);return;
+ }
+ if(op==81){if(!setup)return;vec4 change=global_reduce(false);if(i==0){c[64]+=change.x;for(int axis=0;axis<3;axis++)c[67+axis]+=change[axis+1];}return;}
+ if(op==82){
+  if(!setup||i>=faces())return;ivec3 q;int axis;unpack_face(i,q,axis);
+  vec3 position=coastal_face_position(q,axis);float old=get_value(candidate(),U()+i),value=old;
+  if(!wall_face(q,axis)){
+   float target=offshore_zone(position.x)?coastal_velocity(position,time)[axis]:0;
+   value=mix(old,target,1-exp(-coastal_rate(position.x)*timestep()));
+   if(axis==0&&q.x==0)value=target;
+  }
+  put_value(candidate(),U()+i,value);motion[forward_base()+i]=value-old;return;
+ }
+ if(op==83){
+  if(!setup)return;vec3 change=vec3(0);
+  if(i<N()){
+   ivec3 q=coord(i,n);
+   for(int axis=0;axis<3;axis++){ivec3 r=q;r[axis]++;change[axis]=.5*(motion[forward_base()+face_local(q,axis)]+motion[forward_base()+face_local(r,axis)]);}
+   change*=get_value(candidate(),i)*1000*cell;
+  }sum_partial(vec4(change,0));return;
+ }
+ if(op==84){if(!setup)return;vec3 change=global_reduce(false).xyz;if(i==0)for(int axis=0;axis<3;axis++)c[67+axis]+=change[axis];return;}
+ if(op==86){
+  if(i>=8)return;float probe_time=pc.forcing.w*6.28318530718/pc.wave.z*(i<4?.37:1);
+  vec3 point=vec3(pc.origin_eta.x+.17+float(i)*.23,-pc.wave.w+float(i)*.07,0);
+  vec2 surface=coastal_surface(point.x,probe_time);vec3 velocity=coastal_velocity(point,probe_time);
+  target_probe[i]=vec4(surface,velocity.xy);return;
+ }
+ if(op==87){
+  if(!setup)return;float f=i<N()?get_value(candidate(),i):0;
+  bounds_reduce(isnan(f)||isinf(f)?vec4(-1e30,1e30,0,0):vec4(f,f,0,0));return;
+ }
+ if(op==88){
+  if(!setup||i!=0)return;float minimum=1,maximum=0;
+  for(uint k=0;k<(N()+127)/128;k++){minimum=min(minimum,partial[k].x);maximum=max(maximum,partial[k].y);}
+  c[88]=minimum;c[89]=maximum;if(minimum<0||maximum>1){c[7]=23;c[3]++;}return;
+ }
+ if(op==89){
+  if(i!=0||c[2]<=c[91]||c[2]>pc.fixture.w)return;
+  uint row=(uint(c[2])-1)*5;
+  coastal_history[row]=vec4(c[1],c[90],c[17],c[72]);
+  coastal_history[row+1]=vec4(c[73],c[74],c[40],c[24]);
+  coastal_history[row+2]=vec4(c[80],c[81],c[82],c[83]);
+  coastal_history[row+3]=vec4(c[84],c[85],c[86],c[87]);
+  coastal_history[row+4]=vec4(c[75],c[76],c[77],c[28]);c[91]=c[2];return;
+ }
+ if(op==85){
+  if(i>=8)return;
+  float begin=pc.forcing.x+pc.forcing.y+.4;
+  float end=pc.origin_eta.x+float(n.x)*pc.spacing_dt.x-(pc.fixture.x==6?pc.forcing.y+.4:1.0);
+  int x=clamp(int((mix(begin,end,float(i)/7)-pc.origin_eta.x)/pc.spacing_dt.x),0,n.x-1);
+  float height=0;
+  for(int z=0;z<n.z;z++){
+   float column=pc.origin_eta.y;
+   for(int y=0;y<n.y;y++){ivec3 q=ivec3(x,y,z);column+=(solid(q)?1:get_value(accepted(),index3(q,n)))*pc.spacing_dt.y;}
+   height+=column;
+  }c[80+i]=height/float(n.z);return;
+ }
+}

@@ -1,0 +1,145 @@
+// Reconstruct geometry from stored fractions without modifying them.
+float geometry_fraction(ivec3 q){
+ q=wrap_cell(q);
+#ifdef COASTAL
+ if(q.x<0&&!solid(q))return coastal_fraction(q,c[1]+(geometry_bank()==candidate()?timestep():0));
+#endif
+ if(solid(q)){q=clamp(q,ivec3(0),dims()-1);} // free-slip normal stencil
+ if(outside(q))return 0.0;
+ return get_value(geometry_bank(),index3(q,dims()));
+}
+#ifdef COUPLED
+float transport_f(ivec3 q);
+#endif
+float hf_fraction(ivec3 q,int source){
+#ifdef COUPLED
+ if(source==1)return transport_f(q);
+#endif
+ return geometry_fraction(q);
+}
+bool hf_valid(ivec3 q){q=wrap_cell(q);return !outside(q)&&!solid(q);}
+vec3 height_normal(ivec3 q,vec3 youngs,vec3 spacing,int source,out bool used);
+bool height_normals_enabled(){
+#ifdef HEIGHT_NORMALS
+ return true;
+#elif defined(COUPLED)
+ return (int(pc.numerics.w)&1)!=0;
+#else
+ return false;
+#endif
+}
+// A solid's zero stored F is not an air sample. Use the weighted
+// central stencil in fluid, one-sided differences next to solids, and omit
+// transverse rows buried in solid. This preserves a horizontal free surface
+// at stair-step shorelines without imposing an analytic eta or changing F.
+vec3 interface_gradient(ivec3 q,int source){
+ vec3 gradient=vec3(0);
+ for(int axis=0;axis<3;axis++){
+  int b=(axis+1)%3,d=(axis+2)%3,weights=0;
+  for(int j=-1;j<=1;j++)for(int k=-1;k<=1;k++){
+   ivec3 middle=q;middle[b]+=j;middle[d]+=k;if(solid(middle))continue;
+   ivec3 l=middle,r=middle;l[axis]--;r[axis]++;
+   bool left=!solid(l),right=!solid(r);if(!left&&!right)continue;
+   float difference;
+   if(left&&right)difference=hf_fraction(l,source)-hf_fraction(r,source);
+   else if(left)difference=2*(hf_fraction(l,source)-hf_fraction(middle,source));
+   else difference=2*(hf_fraction(middle,source)-hf_fraction(r,source));
+   int weight=(j==0?2:1)*(k==0?2:1);weights+=weight;
+   gradient[axis]+=float(weight)*difference/(32*pc.spacing_dt[axis]);
+  }
+  if(weights>0)gradient[axis]*=16.0/float(weights);
+ }
+ return gradient;
+}
+vec4 reconstruct_pressure(ivec3 q){
+ float f=geometry_fraction(q);if(f<=0||f>=1)return vec4(0,1,0,f);
+ vec3 gradient=interface_gradient(q,0);
+ if(height_normals_enabled()){bool used;gradient=height_normal(q,gradient,pc.spacing_dt.xyz,0,used);}
+ if(length(gradient)<1e-9)gradient=vec3(0,1,0);
+ vec3 normal=normalize(gradient)*pc.spacing_dt.xyz;normal/=dot(abs(normal),vec3(1));
+ return vec4(normal,inverse_volume(normal,f));
+}
+float segment_distance(vec3 point,vec3 a,vec3 b){
+ vec3 ab=b-a;return length(point-(a+clamp(dot(point-a,ab)/max(dot(ab,ab),1e-30),0,1)*ab));
+}
+// Cube-plane polygon: projection if inside the clipped polygon, otherwise closest
+// edge. Testing all vertex pairs includes every edge (extra internal chords cannot
+// improve on the polygon distance when the projection is outside a convex polygon).
+float polygon_distance(vec3 point,vec4 equation){
+ vec3 h=pc.spacing_dt.xyz,normal=equation.xyz/h;
+ float norm2=dot(normal,normal),signed_d=(dot(normal,point)-equation.w)/sqrt(norm2);
+ vec3 projected=point-normal*(dot(normal,point)-equation.w)/norm2;
+ if(all(greaterThanEqual(projected,vec3(0)))&&all(lessThanEqual(projected,h)))return abs(signed_d);
+ vec3 vertices[12];int count=0;
+ for(int axis=0;axis<3;axis++)for(int j=0;j<2;j++)for(int k=0;k<2;k++){
+  vec3 a=vec3(0);a[(axis+1)%3]=float(j);a[(axis+2)%3]=float(k);
+  float denominator=equation[axis];if(abs(denominator)<1e-15)continue;
+  float t=(equation.w-dot(equation.xyz,a))/denominator;
+  if(t>=0&&t<=1){a[axis]=t;vertices[count++]=a*h;}
+ }
+ float best=1e10;
+ for(int j=0;j<count;j++){best=min(best,length(point-vertices[j]));for(int k=0;k<j;k++)best=min(best,segment_distance(point,vertices[j],vertices[k]));}
+ return best;
+}
+// Clip a face rectangle by two liquid halfspaces (the second complemented).
+// This captures represented phase transitions on cell faces, even without a
+// mixed-cell polygon. Coordinates are local to the left cell.
+int clip_polygon(inout vec3 poly[12],int count,vec4 eq){
+ vec3 result[12];int size=0;
+ for(int j=0;j<count;j++){
+  vec3 a=poly[j],b=poly[(j+1)%count];float da=dot(eq.xyz,a)-eq.w,db=dot(eq.xyz,b)-eq.w;
+  if(da<=0)result[size++]=a;
+  if((da<0&&db>0)||(da>0&&db<0))result[size++]=mix(a,b,da/(da-db));
+ }
+ for(int j=0;j<size;j++)poly[j]=result[j];return size;
+}
+float transition_distance(vec3 point,ivec3 left,int axis){
+ ivec3 right=left;right[axis]++;
+ ivec3 l=wrap_cell(left),r=wrap_cell(right);
+ if(outside(l)||outside(r)||solid(l)||solid(r))return 1e10;
+ float fl=geometry_fraction(l),fr=geometry_fraction(r);
+ if((fl<=0&&fr<=0)||(fl>=1&&fr>=1))return 1e10;
+ vec4 a=geometry_plane[index3(l,dims())],b=geometry_plane[index3(r,dims())];
+ // Uniform phase must clip as a constant inequality, not a spurious box-face plane.
+ if(fl<=0)a=vec4(0,0,0,-1);if(fl>=1)a=vec4(0,0,0,1);
+ if(fr<=0)b=vec4(0,0,0,-1);if(fr>=1)b=vec4(0,0,0,1);
+ b.w+=b[axis];
+ float best=1e10;vec3 h=pc.spacing_dt.xyz;
+ for(int side=0;side<2;side++){
+  vec3 poly[12];int j=(axis+1)%3,k=(axis+2)%3;
+  for(int v=0;v<4;v++){poly[v]=vec3(0);poly[v][axis]=1;poly[v][j]=(v==1||v==2)?1:0;poly[v][k]=v>=2?1:0;}
+  vec4 first=side==0?a:b,second=side==0?-b:-a;
+  int count=clip_polygon(poly,4,first);count=clip_polygon(poly,count,second);
+  if(count==0)continue;
+  vec3 projected=point;projected[axis]=h[axis];vec3 local=projected/h;
+  if(all(greaterThanEqual(local,vec3(0)))&&all(lessThanEqual(local,vec3(1)))&&dot(first.xyz,local)<=first.w&&dot(second.xyz,local)<=second.w)best=min(best,abs(point[axis]-h[axis]));
+  for(int v=0;v<count;v++)best=min(best,segment_distance(point,poly[v]*h,poly[(v+1)%count]*h));
+ }
+ return best;
+}
+float geometry_distance(ivec3 q){
+ float f=geometry_fraction(q);vec3 h=pc.spacing_dt.xyz;
+ if(f>0&&f<1){vec4 eq=geometry_plane[index3(q,dims())];return (dot(eq.xyz,vec3(.5))-eq.w)/length(eq.xyz/h);}
+ // A full/empty center's distance only enters A/G at an incident wet/air
+ // crossing. Else its known sign suffices. Do not approximate any crossing.
+ bool needs_seed=false;
+ for(int axis=0;axis<3;axis++)for(int sign=-1;sign<=1;sign+=2){
+  ivec3 nb=q;nb[axis]+=sign;nb=wrap_cell(nb);if(solid(nb)||outside(nb))continue;
+  float other=geometry_fraction(nb);bool inside=other>=1;
+  if(other>0&&other<1){vec4 eq=geometry_plane[index3(nb,dims())];inside=dot(eq.xyz,vec3(.5))<eq.w;}
+  if(inside!=(f>=1))needs_seed=true;
+ }
+ if(!needs_seed)return (f>=1?-1:1)*length(h)*4;
+ float best=length(h)*4;
+ // Exact one-ring seeds suffice for center-to-center interface crossings. Far
+ // centers retain phase and a finite distance sentinel, never a guessed crossing.
+ for(int x=-1;x<=1;x++)for(int y=-1;y<=1;y++)for(int z=-1;z<=1;z++){
+  ivec3 neighbor=q+ivec3(x,y,z),wrapped=wrap_cell(neighbor);
+  if(outside(wrapped)||solid(wrapped))continue;
+  float fraction=geometry_fraction(wrapped);vec3 point=(vec3(q-neighbor)+.5)*h;
+  if(length(point-clamp(point,vec3(0),h))>=best)continue;
+  if(fraction>0&&fraction<1)best=min(best,polygon_distance(point,geometry_plane[index3(wrapped,dims())]));
+  for(int axis=0;axis<3;axis++)best=min(best,transition_distance(point,neighbor,axis));
+ }
+ return (f>=1?-1:1)*best;
+}

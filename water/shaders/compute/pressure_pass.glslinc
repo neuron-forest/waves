@@ -1,0 +1,139 @@
+void pressure_pass(){
+ uint i=gl_GlobalInvocationID.x;int op=int(pc.dims_op.w);ivec3 n=dims();float dt=timestep();
+ if(op==0){
+  if(i<stride()){a[i]=0;b[i]=0;}
+  #ifdef COUPLED
+#ifdef COASTAL
+  if(i<96)c[i]=0;
+#else
+  if(i<64)c[i]=0;
+#endif
+#else
+  if(i<32)c[i]=0;
+#endif
+  if(i<N()){
+   ivec3 q=coord(i,n);float ph=center(q).y-eta(q);
+   bool wall=solid(q);geo[i]=vec2(ph,wall?-1.0:(ph<0.0?1.0:0.0));
+   float f=wall?0.0:clamp(0.5-ph/pc.spacing_dt.y,0.0,1.0);a[i]=f;b[i]=f;
+  }return;
+ }
+ if(op==1){if(i!=0)return;c[5]=0;if(c[7]>0.5||(pc.options.w>=0?c[2]>=pc.options.w:c[1]>=-pc.options.w))return;if(c[4]<0.5){c[4]=1;c[5]=1;c[6]=0;c[8]=0;c[13]=1;
+#ifdef COUPLED
+ c[32]++;c[57]=0;c[58]=0;
+#endif
+}return;}
+ if(op==2){
+  if(c[5]<0.5||i>=stride())return;
+  float val=get_value(accepted(),i);
+#ifdef COUPLED
+  val=get_value(candidate(),i);
+  if(i<N())work[13*N()+i]=0;
+  if(i>=P()){
+   // Accepted air pressure is zero. Retain a valid guess on old wet centers;
+   // newly wet centers start at zero, and newly air centers are reset.
+   val=wet(coord(i-P(),n))?get_value(accepted(),i):0;
+  }
+#endif
+  if(i>=U()&&i<P()){
+   int axis=i<V()?0:(i<W()?1:2);uint base=axis==0?U():(axis==1?V():W());ivec3 fn=n;fn[axis]++;
+   ivec3 r=coord(i-base,fn),l=r;l[axis]--;
+   if(solid(l)||solid(r)||(!wet(l)&&!wet(r)))val=0.0;
+   else if(axis==1){
+#ifdef COUPLED
+    val-=9.81*dt*c[31];
+#else
+    val-=9.81*dt;
+#endif
+   }
+  }
+  put_value(candidate(),i,val);return;
+ }
+ if(op>=3&&op<=10){pressure_iteration_pass();return;}
+ if(op==11){
+  if(c[4]<0.5||c[6]<0.5||c[7]>0.5||i<U()||i>=P())return;
+  int axis=i<V()?0:(i<W()?1:2);uint base=axis==0?U():(axis==1?V():W());ivec3 fn=n;fn[axis]++;
+  ivec3 r=coord(i-base,fn),l=r;l[axis]--;
+  float value=0;
+  if(!solid(l)&&!solid(r)&&(wet(l)||wet(r)))value=get_value(candidate(),i)-dt/1000.0*(press(r)-press(l))/distance_face(l,r,axis);
+#ifdef COASTAL
+  if(axis==0&&r.x==0&&!solid(r))value=get_value(candidate(),i);
+#endif
+  put_value(candidate(),i,value);return;
+ }
+ if(op==12){
+  if(c[4]<0.5||c[6]<0.5||c[7]>0.5)return;
+  vec4 value=vec4(0);
+  if(i<N()){
+   ivec3 q=coord(i,n);float speed=0;
+   for(int axis=0;axis<3;axis++){ivec3 r=q;r[axis]++;speed=max(speed,max(abs(get_value(candidate(),face_index(q,axis))),abs(get_value(candidate(),face_index(r,axis)))));}
+   float div=wet(q)?dt*abs(divergence(q)):0;
+   float err=wet(q)?abs(press(q)-9810.0*(eta(q)-center(q).y)):0;
+   value=vec4(div,speed,err,get_value(candidate(),i)*pc.spacing_dt.x*pc.spacing_dt.y*pc.spacing_dt.z);
+   if(any(isnan(value))||any(isinf(value)))value=vec4(1e30);
+  }
+  uint lid=gl_LocalInvocationID.x;reduction[lid]=value;barrier();
+  for(uint offset=64;offset>0;offset>>=1){if(lid<offset){reduction[lid].xyz=max(reduction[lid].xyz,reduction[lid+offset].xyz);reduction[lid].w+=reduction[lid+offset].w;}barrier();}
+  if(lid==0)partial[gl_WorkGroupID.x]=reduction[0];return;
+ }
+ if(op==13){
+  if(i!=0||c[4]<0.5||c[6]<0.5||c[7]>0.5)return;
+  vec4 v=vec4(0);for(uint k=0;k<(N()+127)/128;k++){v.xyz=max(v.xyz,partial[k].xyz);v.w+=partial[k].w;}
+  c[14]=v.x;c[15]=v.y;c[16]=v.z;c[17]=v.w;
+#ifdef COUPLED
+  // Recurrence residuals can drift in float32 at small ghost-fluid distances.
+  // Solve a pressure defect from the actual corrected velocity. Preserve F,
+  // geometry, dt, forcing and accumulated pressure; this is bounded continuation.
+  if((v.x>=1e-4||c[61]<.5)&&v.y<1e20&&c[19]<.5&&c[58]<4){c[57]=1;c[58]++;c[6]=0;return;}
+  if(c[61]<.5){c[3]++;c[7]=4;return;}
+#endif
+  if(v.x>=1e-4||v.y>=1e20||c[19]>0.5){c[3]++;c[7]=4;return;}
+  #ifdef COUPLED
+  c[28]=v.w+c[40]+c[39]-c[26]-c[24]-c[22];
+#ifdef COASTAL
+  c[28]+=c[74]+c[66]-c[73]-c[65]-c[72]-c[64];
+#endif
+  if(abs(c[28])>1e-3*max(c[26],1e-20)){c[3]++;c[7]=21;return;}
+  if(c[27]>.450001){c[3]++;c[7]=20;return;}
+  c[24]+=c[22];c[25]+=c[23];c[40]+=c[39];c[29]=0;c[30]=0;
+#ifdef COASTAL
+  for(int field=0;field<6;field++)c[72+field]+=c[64+field];c[90]=dt;
+#endif
+#endif
+  c[0]=float(candidate());c[1]+=dt;c[2]++;c[4]=0;return;
+ }
+ if(op==14){
+  if(i>=N())return;ivec3 q=coord(i,n);float f=get_value(accepted(),i);
+  imageStore(planes,q,vec4(0,1,0,f));imageStore(kinds,q,vec4(f==0?0:(f==1?1:2)));return;
+ }
+ if(op==16){
+#ifdef COUPLED
+  if(c[4]>.5&&c[5]<.5)return;
+#endif
+  if(i>=N())return;ivec3 q=coord(i,n);float diag=0;int face=0;
+  for(int axis=0;axis<3;axis++)for(int sign=-1;sign<=1;sign+=2){ivec3 nb=q;nb[axis]+=sign;float k=wet(q)?coefficient(q,nb,axis):0;work[uint(6+face)*N()+i]=k;diag+=k;face++;}
+  work[12*N()+i]=wet(q)?diag:1.0;return;
+ }
+ if(op==17){
+#ifdef COUPLED
+  if(c[4]>.5&&c[5]<.5)return;
+#endif
+  if(i>=N())return;ivec3 q=coord(i,n);float f=get_value(accepted(),i);
+  vec4 equation=reconstruct_pressure(q);geometry_plane[i]=equation;
+#ifndef COUPLED
+  imageStore(planes,q,equation);imageStore(kinds,q,vec4(f<=0?0:(f>=1?1:2)));
+#endif
+  return;
+ }
+ if(op==19){
+  if(i>=N()||c[4]>.5)return;ivec3 q=coord(i,n);float f=get_value(accepted(),i);
+  imageStore(planes,q,reconstruct_pressure(q));imageStore(kinds,q,vec4(f<=0?0:(f>=1?1:2)));return;
+ }
+ if(op==18){
+#ifdef COUPLED
+  if(c[4]>.5&&c[5]<.5)return;
+#endif
+  if(i>=N())return;ivec3 q=coord(i,n);float f=get_value(geometry_bank(),i);
+  float ph=geometry_distance(q);geo[i]=vec2(ph,solid(q)?-1:(ph<0?1:0));return;
+ }
+ if(op==15){if(i==0)c[19]=1;return;}
+}
