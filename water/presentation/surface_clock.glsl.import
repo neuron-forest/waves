@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dqokhgrkbip6"
+path="res://.godot/imported/surface_clock.glsl-826c3210cc27b905c8be6dfd45776bd8.res"
+
+[deps]
+
+source_file="res://water/presentation/surface_clock.glsl"
+dest_files=["res://.godot/imported/surface_clock.glsl-826c3210cc27b905c8be6dfd45776bd8.res"]
+
+[params]
+
